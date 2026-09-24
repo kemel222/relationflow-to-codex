@@ -49,15 +49,39 @@ export interface ChatCompletionRequest {
 
 function formatMessagesForRelationFlow(messages: ChatMessage[]): string {
   if (!messages || messages.length === 0) return '';
-  if (messages.length === 1) return messages[0].content;
 
-  return messages.map(m => {
+  const MAX_CHARS = 9800; // Leave safety margin below RelationFlow's 10,000 char limit
+
+  const formatted = messages.map(m => {
     const role = (m.role || 'user').toLowerCase();
-    if (role === 'system') return `[System Instructions]:\n${m.content}`;
+    if (role === 'system') return `[System]:\n${m.content}`;
     if (role === 'assistant') return `[Assistant]:\n${m.content}`;
     return `[User]:\n${m.content}`;
-  }).join('\n\n');
+  });
+
+  // Most recent message has top priority
+  let lastMsg = formatted[formatted.length - 1];
+  if (lastMsg.length > MAX_CHARS) {
+    return lastMsg.slice(0, MAX_CHARS - 120) + '\n\n[... Truncated to 9800 chars due to RelationFlow message length limit]';
+  }
+
+  // Work backwards from the second to last message to include recent context
+  const selected: string[] = [lastMsg];
+  let currentLen = lastMsg.length;
+
+  for (let i = formatted.length - 2; i >= 0; i--) {
+    const msg = formatted[i];
+    if (currentLen + msg.length + 2 <= MAX_CHARS) {
+      selected.unshift(msg);
+      currentLen += msg.length + 2;
+    } else {
+      break;
+    }
+  }
+
+  return selected.join('\n\n');
 }
+
 
 export function createProxyApp(config: ProxyConfig) {
   const app = express();
