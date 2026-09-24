@@ -2,6 +2,7 @@ import readline from 'node:readline';
 import path from 'node:path';
 import fs from 'node:fs';
 import { TokenManager } from './token-manager.ts';
+import { resolveUpstreamModel } from './model-resolver.ts';
 
 // Load .env if present
 const envPath = path.resolve(import.meta.dirname, '../.env');
@@ -75,11 +76,12 @@ async function handleToolsCall(name: string, args: any) {
       headers['Cookie'] = auth.session_cookie;
     }
 
+    const targetModel = resolveUpstreamModel(args.model);
     const res = await fetch(upstreamUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        model: args.model || 'relationflow-default',
+        model: targetModel,
         messages,
         stream: false
       })

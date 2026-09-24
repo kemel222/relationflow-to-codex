@@ -204,4 +204,24 @@ test('RelationFlow Proxy End-to-End Suite', async (t) => {
       'Concurrent requests must trigger exactly ONE token refresh'
     );
   });
+
+  await t.test('5. [Model Mapping] Translates gpt-6-astra to RelationFlow target model', async () => {
+    const res = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-6-astra',
+        messages: [{ role: 'user', content: 'Testing astra remapping' }],
+        stream: false
+      })
+    });
+
+    assert.equal(res.status, 200);
+    const lastUpstreamCall = upstreams.relationFlowHistory[upstreams.relationFlowHistory.length - 1];
+    assert.equal(
+      lastUpstreamCall.body.model,
+      'gpt-4o',
+      'Should remap gpt-6-astra to configured DEFAULT_MODEL (gpt-4o)'
+    );
+  });
 });

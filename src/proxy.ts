@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import crypto from 'node:crypto';
 import { TokenManager, type TokenManagerConfig } from './token-manager.ts';
+import { resolveUpstreamModel } from './model-resolver.ts';
 
 export interface ProxyConfig {
   port?: number;
@@ -30,9 +31,22 @@ export function createProxyApp(config: ProxyConfig) {
   });
 
   app.get(['/v1', '/v1/models'], (_req: Request, res: Response) => {
+    const defaultModel = resolveUpstreamModel();
     res.json({
       object: 'list',
       data: [
+        {
+          id: defaultModel,
+          object: 'model',
+          created: 1700000000,
+          owned_by: 'relationflow'
+        },
+        {
+          id: 'gpt-6-astra',
+          object: 'model',
+          created: 1700000000,
+          owned_by: 'relationflow'
+        },
         {
           id: 'relationflow-chat',
           object: 'model',
@@ -40,13 +54,13 @@ export function createProxyApp(config: ProxyConfig) {
           owned_by: 'relationflow'
         },
         {
-          id: 'gpt-4o',
+          id: 'claude-3-5-sonnet',
           object: 'model',
           created: 1700000000,
           owned_by: 'relationflow'
         },
         {
-          id: 'gpt-4o-mini',
+          id: 'gpt-4o',
           object: 'model',
           created: 1700000000,
           owned_by: 'relationflow'
@@ -86,12 +100,18 @@ export function createProxyApp(config: ProxyConfig) {
         headers['Cookie'] = tokenState.session_cookie;
       }
 
-      // 3. Forward request to RelationFlow /api/chat
+      // 3. Forward request to RelationFlow /api/chat with model mapping
+      const upstreamModel = resolveUpstreamModel(body.model);
+      const upstreamBody = {
+        ...body,
+        model: upstreamModel
+      };
+
       const upstreamUrl = `${config.relationFlowUrl.replace(/\/+$/, '')}/api/chat`;
       const upstreamResponse = await fetch(upstreamUrl, {
         method: 'POST',
         headers,
-        body: JSON.stringify(body)
+        body: JSON.stringify(upstreamBody)
       });
 
       if (!upstreamResponse.ok) {
