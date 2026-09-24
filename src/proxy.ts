@@ -5,6 +5,7 @@ import path from 'node:path';
 import { TokenManager, type TokenState } from './token-manager.ts';
 import { resolveUpstreamModel } from './model-resolver.ts';
 import { uploadAttachment } from './attachment-manager.ts';
+import { LogiccClient } from './logicc-client.ts';
 
 // Auto-load .env if present
 function loadEnv() {
@@ -52,6 +53,7 @@ export interface ProxyConfig {
   relationFlowUrl: string;
   accountSlug?: string;
   tokenManager: TokenManager;
+  logiccClient?: LogiccClient;
 }
 
 export interface ChatMessage {
@@ -78,13 +80,11 @@ export function formatMessagesForRelationFlow(messages: ChatMessage[], maxChars 
     return `[User]:\n${m.content}`;
   });
 
-  // Most recent message has top priority
   let lastMsg = formatted[formatted.length - 1];
   if (lastMsg.length > maxChars) {
-    return lastMsg.slice(0, maxChars - 120) + '\n\n[... Truncated to fit RelationFlow message limit]';
+    return lastMsg.slice(0, maxChars - 120) + '\n\n[... Truncated to fit message limit]';
   }
 
-  // Work backwards from the second to last message to include recent context
   const selected: string[] = [lastMsg];
   let currentLen = lastMsg.length;
 
@@ -101,6 +101,108 @@ export function formatMessagesForRelationFlow(messages: ChatMessage[], maxChars 
   return selected.join('\n\n');
 }
 
+async function handleLogiccStream(
+  stream: ReadableStream<Uint8Array>,
+  res: Response,
+  isStream: boolean,
+  chatId: string,
+  created: number,
+  model: string
+) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullContent = '';
+
+  if (isStream) {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(dataStr);
+          if (parsed.type === 'text-delta' && typeof parsed.delta === 'string') {
+            fullContent += parsed.delta;
+            if (isStream) {
+              const chunkPayload = {
+                id: chatId,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: parsed.delta },
+                    finish_reason: null
+                  }
+                ]
+              };
+              res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (isStream) {
+      const finishPayload = {
+        id: chatId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+      };
+      res.write(`data: ${JSON.stringify(finishPayload)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      res.setHeader('Content-Type', 'application/json');
+      res.json({
+        id: chatId,
+        object: 'chat.completion',
+        created,
+        model,
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: fullContent },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: {
+          prompt_tokens: 0,
+          completion_tokens: fullContent.length,
+          total_tokens: fullContent.length
+        }
+      });
+    }
+  } catch (err: any) {
+    console.error('[Logicc Stream Adapter Error]', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: { message: err.message, type: 'logicc_stream_error' } });
+    } else {
+      res.end();
+    }
+  }
+}
+
 export function createProxyApp(config: ProxyConfig) {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
@@ -108,12 +210,12 @@ export function createProxyApp(config: ProxyConfig) {
   app.get('/health', (_req: Request, res: Response) => {
     res.json({
       status: 'ok',
+      providers: ['relationflow', config.logiccClient ? 'logicc' : null].filter(Boolean),
       activeThreadId: getActiveThreadId(),
       timestamp: new Date().toISOString()
     });
   });
 
-  // Endpoint to reset thread / start fresh conversation
   app.all(['/v1/thread/new', '/v1/thread/reset'], (_req: Request, res: Response) => {
     const newThreadId = crypto.randomUUID();
     saveActiveThreadId(newThreadId);
@@ -126,42 +228,13 @@ export function createProxyApp(config: ProxyConfig) {
     res.json({
       object: 'list',
       data: [
-        {
-          id: defaultModel,
-          object: 'model',
-          created: 1700000000,
-          owned_by: 'relationflow'
-        },
-        {
-          id: 'claude-opus-5.5',
-          object: 'model',
-          created: 1700000000,
-          owned_by: 'relationflow'
-        },
-        {
-          id: 'gpt-6-astra',
-          object: 'model',
-          created: 1700000000,
-          owned_by: 'relationflow'
-        },
-        {
-          id: 'relationflow-chat',
-          object: 'model',
-          created: 1700000000,
-          owned_by: 'relationflow'
-        },
-        {
-          id: 'claude-3-5-sonnet',
-          object: 'model',
-          created: 1700000000,
-          owned_by: 'relationflow'
-        },
-        {
-          id: 'gpt-4o',
-          object: 'model',
-          created: 1700000000,
-          owned_by: 'relationflow'
-        }
+        { id: defaultModel, object: 'model', created: 1700000000, owned_by: 'relationflow' },
+        { id: 'claude-opus-5.5', object: 'model', created: 1700000000, owned_by: 'relationflow' },
+        { id: 'logicc:claude-5.5-opus', object: 'model', created: 1700000000, owned_by: 'logicc' },
+        { id: 'logicc-opus', object: 'model', created: 1700000000, owned_by: 'logicc' },
+        { id: 'claude-5.5-opus', object: 'model', created: 1700000000, owned_by: 'logicc' },
+        { id: 'gpt-6-astra', object: 'model', created: 1700000000, owned_by: 'relationflow' },
+        { id: 'relationflow-chat', object: 'model', created: 1700000000, owned_by: 'relationflow' }
       ]
     });
   });
@@ -181,26 +254,41 @@ export function createProxyApp(config: ProxyConfig) {
     const isStream = Boolean(body.stream);
     const chatId = `chatcmpl-${crypto.randomUUID()}`;
     const created = Math.floor(Date.now() / 1000);
-    const clientModel = body.model || 'managed:claude-opus-5.5';
+    const clientModel = (body.model || '').toLowerCase().trim();
 
+    // Check if routed to Logicc
+    const isLogicc =
+      clientModel.startsWith('logicc') ||
+      clientModel === 'claude-5.5-opus' ||
+      process.env.DEFAULT_PROVIDER === 'logicc';
+
+    if (isLogicc && config.logiccClient) {
+      const userPrompt = formatMessagesForRelationFlow(body.messages, 40000);
+      try {
+        const stream = await config.logiccClient.streamChat({
+          prompt: userPrompt,
+          modelId: 'claude-5.5-opus'
+        });
+        return await handleLogiccStream(stream, res, isStream, chatId, created, body.model || 'logicc:claude-5.5-opus');
+      } catch (err: any) {
+        console.error('[Logicc Error]', err);
+        return res.status(500).json({ error: { message: err.message, type: 'logicc_error' } });
+      }
+    }
+
+    // Default: Route to RelationFlow
     try {
-      // 1. Obtain valid access token (refreshes via Supabase Auth if needed)
       let tokenState = await config.tokenManager.getValidToken();
 
-      // 2. Prepare request payload for RelationFlow /api/chat
       const upstreamModel = resolveUpstreamModel(body.model);
       const accountSlug = config.accountSlug || process.env.ACCOUNT_SLUG || 'mihjrus1xyp7';
       const activeThreadId = body.threadId || getActiveThreadId();
 
-      // Join full content to check size
       const rawFullMessage = body.messages.map(m => m.content).join('\n\n');
       let attachments: any[] = [];
       let finalMessage = '';
 
-      // If prompt/files exceed 7500 chars, auto-upload full context as encrypted attachment
-      // so Claude receives up to 100k+ tokens without hitting 10,000 char message limit!
       if (rawFullMessage.length > 7500) {
-        console.log(`[Proxy] Large prompt detected (${rawFullMessage.length} chars). Uploading as encrypted attachment...`);
         try {
           attachments = await uploadAttachment({
             content: rawFullMessage,
@@ -211,9 +299,7 @@ export function createProxyApp(config: ProxyConfig) {
             relationFlowUrl: config.relationFlowUrl,
             tokenManager: config.tokenManager
           });
-          console.log(`[Proxy] Attachment uploaded successfully. Attachment IDs:`, attachments.map(a => a.id));
 
-          // Get last user prompt as the message text
           const lastUserMsg = body.messages.filter(m => m.role === 'user').pop();
           const instruction = lastUserMsg ? lastUserMsg.content.slice(0, 2000) : 'Обработай прикрепленный файл и контекст.';
           finalMessage = `[Полный контекст диалога и прикрепленные файлы загружены во вложение]\n\nЗапрос пользователя:\n${instruction}`;
@@ -249,12 +335,8 @@ export function createProxyApp(config: ProxyConfig) {
           'Referer': `${config.relationFlowUrl}/dashboard/${accountSlug}/chat?thread=${activeThreadId}`,
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         };
-        if (token.session_cookie) {
-          headers['Cookie'] = token.session_cookie;
-        }
-        if (token.access_token) {
-          headers['Authorization'] = `Bearer ${token.access_token}`;
-        }
+        if (token.session_cookie) headers['Cookie'] = token.session_cookie;
+        if (token.access_token) headers['Authorization'] = `Bearer ${token.access_token}`;
         return headers;
       };
 
@@ -265,7 +347,6 @@ export function createProxyApp(config: ProxyConfig) {
         body: JSON.stringify(upstreamBody)
       });
 
-      // Auto retry once on 401 with force token refresh
       if (upstreamResponse.status === 401) {
         console.log('[Proxy] Upstream 401: force refreshing Supabase session token...');
         tokenState = await config.tokenManager.forceRefresh();
@@ -276,9 +357,7 @@ export function createProxyApp(config: ProxyConfig) {
         });
       }
 
-      // If thread not found (404), reset thread and retry once
       if (upstreamResponse.status === 404) {
-        console.log('[Proxy] Upstream 404: thread not found, creating new thread...');
         const newThreadId = crypto.randomUUID();
         saveActiveThreadId(newThreadId);
         upstreamBody.threadId = newThreadId;
@@ -289,7 +368,6 @@ export function createProxyApp(config: ProxyConfig) {
         });
       }
 
-      // Persist thread ID returned in headers
       const respThreadId = upstreamResponse.headers.get('x-thread-id');
       if (respThreadId && respThreadId !== activeThreadId) {
         saveActiveThreadId(respThreadId);
@@ -307,18 +385,12 @@ export function createProxyApp(config: ProxyConfig) {
       }
 
       if (!upstreamResponse.body) {
-        return res.status(502).json({
-          error: {
-            message: 'Empty response body from RelationFlow upstream',
-            type: 'upstream_error'
-          }
-        });
+        return res.status(502).json({ error: { message: 'Empty body from upstream', type: 'upstream_error' } });
       }
 
       const reader = upstreamResponse.body.getReader();
       const decoder = new TextDecoder('utf-8');
 
-      // 4. Branch based on stream flag
       if (isStream) {
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -337,32 +409,19 @@ export function createProxyApp(config: ProxyConfig) {
               id: chatId,
               object: 'chat.completion.chunk',
               created,
-              model: clientModel,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: textChunk },
-                  finish_reason: null
-                }
-              ]
+              model: body.model || 'managed:claude-opus-5.5',
+              choices: [{ index: 0, delta: { content: textChunk }, finish_reason: null }]
             };
 
             res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
           }
 
-          // Final stop chunk
           const finishPayload = {
             id: chatId,
             object: 'chat.completion.chunk',
             created,
-            model: clientModel,
-            choices: [
-              {
-                index: 0,
-                delta: {},
-                finish_reason: 'stop'
-              }
-            ]
+            model: body.model || 'managed:claude-opus-5.5',
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
           };
           res.write(`data: ${JSON.stringify(finishPayload)}\n\n`);
           res.write('data: [DONE]\n\n');
@@ -370,7 +429,6 @@ export function createProxyApp(config: ProxyConfig) {
           res.end();
         }
       } else {
-        // [stream = false]: accumulate entire upstream text into one completion object
         let fullContent = '';
         while (true) {
           const { done, value } = await reader.read();
@@ -382,22 +440,9 @@ export function createProxyApp(config: ProxyConfig) {
           id: chatId,
           object: 'chat.completion',
           created,
-          model: clientModel,
-          choices: [
-            {
-              index: 0,
-              message: {
-                role: 'assistant',
-                content: fullContent
-              },
-              finish_reason: 'stop'
-            }
-          ],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: fullContent.length,
-            total_tokens: fullContent.length
-          }
+          model: body.model || 'managed:claude-opus-5.5',
+          choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: fullContent.length, total_tokens: fullContent.length }
         };
 
         res.setHeader('Content-Type', 'application/json');
@@ -406,12 +451,7 @@ export function createProxyApp(config: ProxyConfig) {
     } catch (err: any) {
       console.error('[Proxy Error]', err);
       if (!res.headersSent) {
-        res.status(500).json({
-          error: {
-            message: err.message || 'Internal proxy error',
-            type: 'proxy_error'
-          }
-        });
+        res.status(500).json({ error: { message: err.message || 'Internal proxy error', type: 'proxy_error' } });
       } else {
         res.end();
       }
@@ -440,15 +480,27 @@ if (process.argv[1] && process.argv[1].endsWith('proxy.ts')) {
     }
   });
 
+  let logiccClient: LogiccClient | undefined;
+  if (process.env.LOGICC_SESSION_ID && process.env.LOGICC_CLIENT_COOKIE) {
+    logiccClient = new LogiccClient({
+      sessionId: process.env.LOGICC_SESSION_ID,
+      orgId: process.env.LOGICC_ORG_ID,
+      clientCookie: process.env.LOGICC_CLIENT_COOKIE,
+      defaultChatId: process.env.LOGICC_CHAT_ID
+    });
+    console.log('[Proxy] Logicc provider enabled with Clerk session touch auto-renewal.');
+  }
+
   const app = createProxyApp({
     port,
     relationFlowUrl,
     accountSlug,
-    tokenManager
+    tokenManager,
+    logiccClient
   });
 
   app.listen(port, () => {
-    console.log(`[RelationFlow Proxy] Listening on http://localhost:${port}`);
+    console.log(`[RelationFlow & Logicc Proxy] Listening on http://localhost:${port}`);
     console.log(`Active thread ID: ${getActiveThreadId()}`);
     console.log(`OpenAI API compatible endpoint: http://localhost:${port}/v1/chat/completions`);
   });
