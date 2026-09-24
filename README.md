@@ -1,34 +1,206 @@
-# RelationFlow OpenAI-Compatible Proxy
+# 🚀 RelationFlow to Codex / VS Code Proxy (Claude Opus 5.5)
 
-Прокси-сервер, реализующий спецификацию OpenAI API (`/v1/chat/completions`) поверх сервиса RelationFlow с автоматическим управлением жизненным циклом сессии Supabase Auth.
+Универсальный локальный прокси-сервер, превращающий ваш аккаунт **RelationFlow** в стандартный **OpenAI-совместимый API** (`http://localhost:3000/v1`).
 
-## Возможности
+Позволяет использовать флагманскую модель **Claude Opus 5.5** (с поддержкой до **1 000 000 токенов**) в **VS Code (Continue)**, **Codex / ChatGPT Desktop**, Cursor и любых других инструментах разработчика **без расхода платных лимитов OpenAI**.
 
-- **OpenAI-совместимость**: Поддержка эндпоинта `/v1/chat/completions` для использования с официальными SDK OpenAI, LangChain, curl и другими клиентами.
-- **Два режима ответа**:
-  - `stream: true`: Поток Server-Sent Events (SSE) с чанками `chat.completion.chunk` и финальным `data: [DONE]`.
-  - `stream: false`: Агрегация всего потока ответа в единый JSON-объект `chat.completion`.
-- **Автоматический рефреш Supabase Auth**:
-  - Автоматическое обновление токена перед истечением срока жизни (`POST /auth/v1/token?grant_type=refresh_token`).
-  - Сохранение и ротация `refresh_token` на диске (`tokens.json`).
-  - Передача сессионных `Cookie` и `Authorization: Bearer <access_token>` в RelationFlow.
-  - Защита от состояния гонки (in-flight promise mutex) при параллельных запросах.
+---
 
-## Структура проекта
+## 🌟 Ключевые возможности
 
-- `src/proxy.ts` — HTTP-сервер Express, роутинг OpenAI API и адаптер потока.
-- `src/token-manager.ts` — Менеджер токенов Supabase с ротацией и файловым сохранением.
-- `src/mock-upstream.ts` — Mock-серверы Supabase Auth и RelationFlow для автономного тестирования.
-- `test/proxy.test.ts` — End-to-end тесты всех сценариев схемы.
+1. **Полная совместимость с OpenAI API**:
+   - Эндпоинты `/v1/chat/completions` (со стримингом SSE и без него) и `/v1/models`.
+2. **Память и непрерывность диалога (Thread Persistence)**:
+   - Модель **не забывает контекст** между сообщениями. Запросы привязываются к постоянному треду RelationFlow.
+   - Хотите чистый лист? Одно нажатие сбрасывает тред (`/v1/thread/new`).
+3. **Поддержка файлов до 1 000 000 токенов (Обход лимита 10 000 символов)**:
+   - В вебе RelationFlow стоит ограничение 10 000 символов на текстовое сообщение.
+   - Прокси автоматически определяет большие файлы/запросы (>7 500 символов), шифрует их на лету (AES-GCM Framing `CLM1`), загружает в облачное хранилище вложений и передает модели целиком.
+4. **Вечная сессия (Автоматическая ротация токенов Supabase Auth)**:
+   - Прокси сам следит за сроком жизни сессии, автоматически ротирует `refresh_token` и пересобирает сессионные куки.
+   - Если сервер спал или токен истек — прокси автоматически сделает рефреш и повторит запрос без ошибки.
 
-## Запуск тестов
+---
+
+## 📋 Требования
+
+- **Node.js** версии **20.x, 22.x или выше** (проверить: `node -v`).
+- Браузер с авторизованным аккаунтом в [RelationFlow](https://app.relationflow.io).
+- Любой редактор (например, **VS Code** с расширением **Continue**).
+
+---
+
+## 🛠️ Пошаговая инструкция по установке (для новичков)
+
+### Шаг 1. Клонирование репозитория
+
+Откройте терминал (PowerShell / Command Prompt / bash) и выполните:
+
+```bash
+git clone git@github.com:kemel222/relationflow-to-codex.git
+cd relationflow-to-codex
+```
+
+### Шаг 2. Установка зависимостей
+
+```bash
+npm install
+```
+
+---
+
+### Шаг 3. Как достать свои данные из браузера (1 минута)
+
+1. Откройте сайт [app.relationflow.io](https://app.relationflow.io) и войдите в свой аккаунт.
+2. Откройте любой чат (или создайте новый).
+3. Нажмите клавишу **F12** (или `Ctrl + Shift + I`), чтобы открыть **Инструменты разработчика (DevTools)**.
+4. Перейдите во вкладку **Сеть (Network)**.
+5. Напишите в чате любое слово (например, «тест») и отправьте.
+6. В списке запросов найдите строчку **`chat`** (метод `POST` по адресу `/api/chat`).
+7. Кликните по ней правой кнопкой мыши:
+   - **Копировать (Copy)** ➡️ **Копировать как cURL (bash / cmd / PowerShell)**.
+8. Из скопированного запроса вам понадобятся всего 2 вещи:
+   - **`accountSlug`**: виден в адресной строке браузера: `https://app.relationflow.io/dashboard/<ВАШ_СЛАГ>/chat` (например, `mihjrus1xyp7`).
+   - **`refresh_token`**: внутри куки `sb-auth-auth-token.0` (либо в `Application/Storage` -> `Cookies` -> `sb-auth-auth-token`).
+
+---
+
+### Шаг 4. Настройка файла `.env`
+
+Создайте файл `.env` в корне папки проекта (или скопируйте `.env.example`):
+
+```bash
+cp .env.example .env
+```
+
+Откройте `.env` и вставьте ваши данные:
+
+```env
+PORT=3000
+RELATIONFLOW_URL=https://app.relationflow.io
+SUPABASE_URL=https://auth.relationflow.io
+SUPABASE_ANON_KEY=sb_publishable_tHnRZvqCh23wsocWynthJg_5bQVoFsA
+
+# Ваш slug аккаунта (из адреса в браузере)
+ACCOUNT_SLUG=mihjrus1xyp7
+
+# Ваш начальный refresh токен
+INITIAL_REFRESH_TOKEN=ваш_refresh_token
+
+# Целевая модель по умолчанию
+DEFAULT_MODEL=managed:claude-opus-5.5
+```
+
+---
+
+### Шаг 5. Запуск прокси-сервера
+
+Запустите сервер командой:
+
+```bash
+npm start
+```
+
+Вы увидите сообщение:
+```text
+[RelationFlow Proxy] Listening on http://localhost:3000
+Active thread ID: a8d485fd-cd18-4abf-be15-288d6880670e
+OpenAI API compatible endpoint: http://localhost:3000/v1/chat/completions
+```
+
+Прокси успешно запущен и готов принимать запросы! 🎉
+
+---
+
+## 💻 Настройка в VS Code (Расширение Continue)
+
+**Continue** — это популярное расширение для VS Code, заменяющее GitHub Copilot.
+
+### 1. Установите расширение Continue
+В VS Code откройте вкладку расширений (`Ctrl + Shift + X`), найдите **Continue** и нажмите **Install**.
+
+### 2. Откройте файл конфигурации Continue
+Файл находится по пути:
+- **Windows**: `C:\Users\<ВашПользователь>\.continue\config.yaml`
+- **macOS / Linux**: `~/.continue/config.yaml`
+
+(Также можно нажать на иконку шестеренки внизу панели Continue в VS Code).
+
+### 3. Добавьте модель RelationFlow
+Вставьте следующий блок в секцию `models`:
+
+```yaml
+models:
+  - name: RelationFlow (Opus 5.5)
+    provider: openai
+    model: claude-opus-5.5
+    apiBase: http://localhost:3000/v1
+    apiKey: dummy
+    contextLength: 1000000
+```
+
+> **Важно:** параметр `contextLength: 1000000` сообщает Continue, что модель поддерживает контекстное окно до 1 миллиона токенов!
+
+### 4. Как пользоваться в редакторе:
+1. В выпадающем меню выбора модели в окне Continue выберите **`RelationFlow (Opus 5.5)`**.
+2. **Для вопросов по коду:** выделите любой фрагмент кода в редакторе и нажмите **`Ctrl + L`**.
+3. **Для редактирования прямо в файле:** выделите код и нажмите **`Ctrl + I`**.
+4. **Для добавления файлов в контекст:** напишите символ **`@`** в строке ввода чата (например, `@index.html`, `@Files` или `@codebase`).
+
+---
+
+## 🤖 Настройка в ChatGPT Desktop / Codex / других клиентах
+
+Прокси полностью совместим с любым клиентом, поддерживающим пользовательский OpenAI Base URL:
+
+- **Base URL**: `http://localhost:3000/v1`
+- **API Key**: `dummy` (любая строка)
+- **Model Name**: `managed:claude-opus-5.5` (или алиасы: `opus-5.5`, `gpt-6-astra`, `opus`)
+
+Также в проекте предусмотрен встроенный stdio **MCP-сервер** (`src/mcp-server.ts`). Для его подключения в `config.toml` Codex:
+
+```toml
+[mcp_servers.relationflow]
+command = "node"
+args = ["--experimental-strip-types", "C:/путь/к/relationflow-proxy/src/mcp-server.ts"]
+```
+
+---
+
+## 🔄 Управление памятью и диалогами
+
+* **Память по умолчанию включена:** Все запросы отправляются в единый тред, поэтому модель помнит всё, что вы обсуждали раньше.
+* **Как начать новый диалог:**
+  - Просто перейдите по адресу: `http://localhost:3000/v1/thread/new` в браузере или отправьте GET-запрос.
+  - Либо нажмите иконку **«+» (New Session)** в Continue.
+
+---
+
+## 🧪 Тестирование и проверка
+
+Прогнать встроенный набор автономных тестов:
 
 ```bash
 npm test
 ```
 
-## Запуск сервиса
+Проверить статус здоровья прокси в браузере:
+[http://localhost:3000/health](http://localhost:3000/health)
 
-```bash
-npm start
-```
+---
+
+## ❓ Частые вопросы и решение проблем (FAQ)
+
+**Вопрос: Возникает ошибка 401 Unauthorized?**
+> **Ответ:** Скорее всего, истёк первоначальный `refresh_token`. Просто обновите страницу в RelationFlow, скопируйте свежий токен из кук и сохраните в `.env`. После первого запуска прокси сам будет автоматически продлевать сессию без вашего участия.
+
+**Вопрос: Что за ошибка «Message exceeds maximum length of 10,000 characters»?**
+> **Ответ:** В старых версиях RelationFlow отклонял слишком длинные текстовые запросы. В этом прокси встроена система автоматического шифрования и загрузки вложений: любые файлы и промпты более 7 500 символов прозрачно прикрепляются файлами через AES-GCM и без проблем читаются моделью.
+
+**Вопрос: Расходуются ли мои деньги или лимиты OpenAI?**
+> **Ответ:** Нет! Все запросы идут через ваш аккаунт RelationFlow, используя подписку и мощности RelationFlow для работы с Claude Opus 5.5.
+
+---
+
+## 📄 Лицензия
+MIT
