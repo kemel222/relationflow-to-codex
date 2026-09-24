@@ -72,6 +72,15 @@ export class TokenManager {
     return this.refreshPromise;
   }
 
+  async forceRefresh(): Promise<TokenState> {
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.refreshToken().finally(() => {
+        this.refreshPromise = null;
+      });
+    }
+    return this.refreshPromise;
+  }
+
   private async refreshToken(): Promise<TokenState> {
     const current = await this.loadTokens();
 
@@ -79,7 +88,7 @@ export class TokenManager {
       throw new Error('Cannot refresh token: no refresh_token available');
     }
 
-    const refreshUrl = `${this.config.supabaseUrl}/auth/v1/token?grant_type=refresh_token`;
+    const refreshUrl = `${this.config.supabaseUrl.replace(/\/+$/, '')}/auth/v1/token?grant_type=refresh_token`;
     const response = await fetch(refreshUrl, {
       method: 'POST',
       headers: {
@@ -100,16 +109,42 @@ export class TokenManager {
       access_token: string;
       refresh_token: string;
       expires_in?: number;
+      expires_at?: number;
+      [key: string]: any;
     };
 
-    const setCookie = response.headers.get('set-cookie');
     const expiresInSec = data.expires_in || 3600;
+    const expiresAt = data.expires_at ? data.expires_at * 1000 : Date.now() + expiresInSec * 1000;
+
+    // Reconstruct Supabase session cookie chunking
+    const sessionJson = JSON.stringify(data);
+    const sessionBase64 = Buffer.from(sessionJson).toString('base64');
+    const CHUNK_SIZE = 3180;
+    const chunk0 = sessionBase64.slice(0, CHUNK_SIZE);
+    const chunk1 = sessionBase64.slice(CHUNK_SIZE);
+
+    let otherCookies: string[] = [];
+    if (current.session_cookie) {
+      otherCookies = current.session_cookie
+        .split(';')
+        .map(c => c.trim())
+        .filter(c => c && !c.startsWith('sb-auth-auth-token.'));
+    }
+    if (otherCookies.length === 0) {
+      otherCookies = ['relationflow-beta-notice-dismissed=v1', 'NEXT_LOCALE=en'];
+    }
+
+    const newCookie = [
+      `sb-auth-auth-token.0=base64-${chunk0}`,
+      ...(chunk1 ? [`sb-auth-auth-token.1=${chunk1}`] : []),
+      ...otherCookies
+    ].join('; ');
 
     const newState: TokenState = {
       access_token: data.access_token,
       refresh_token: data.refresh_token, // Rotated refresh token!
-      expires_at: Date.now() + expiresInSec * 1000,
-      session_cookie: setCookie || current.session_cookie
+      expires_at: expiresAt,
+      session_cookie: newCookie
     };
 
     await this.saveTokens(newState);
@@ -120,3 +155,4 @@ export class TokenManager {
     return this.state;
   }
 }
+

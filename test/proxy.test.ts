@@ -91,7 +91,7 @@ test('RelationFlow Proxy End-to-End Suite', async (t) => {
     // Verify RelationFlow received the refreshed Bearer token and cookie
     assert.equal(upstreams.relationFlowHistory.length, 1);
     assert.equal(upstreams.relationFlowHistory[0].authorization, 'Bearer supabase-access-token-1');
-    assert.match(upstreams.relationFlowHistory[0].cookie || '', /sb_session=session_cookie_v1/);
+    assert.match(upstreams.relationFlowHistory[0].cookie || '', /sb-auth-auth-token/);
 
     // Verify tokens were persisted to disk with rotation
     const rawSaved = await fs.readFile(TEST_TOKENS_FILE, 'utf-8');
@@ -220,8 +220,8 @@ test('RelationFlow Proxy End-to-End Suite', async (t) => {
     const lastUpstreamCall = upstreams.relationFlowHistory[upstreams.relationFlowHistory.length - 1];
     assert.equal(
       lastUpstreamCall.body.model,
-      'claude-opus-5.5',
-      'Should remap gpt-6-astra to configured DEFAULT_MODEL (claude-opus-5.5)'
+      'managed:claude-opus-5.5',
+      'Should remap gpt-6-astra to configured DEFAULT_MODEL (managed:claude-opus-5.5)'
     );
   });
 });

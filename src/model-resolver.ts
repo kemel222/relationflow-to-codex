@@ -1,5 +1,5 @@
 export function resolveUpstreamModel(requestedModel?: string): string {
-  const defaultModel = process.env.DEFAULT_MODEL || 'claude-opus-5.5';
+  const defaultModel = process.env.DEFAULT_MODEL || 'managed:claude-opus-5.5';
 
   if (!requestedModel) {
     return defaultModel;
@@ -20,10 +20,11 @@ export function resolveUpstreamModel(requestedModel?: string): string {
     'opus 5.5': defaultModel,
     'claude-opus-5.5': defaultModel,
     'claude-5.5-opus': defaultModel,
-    'claude-3-5-opus': defaultModel
+    'claude-3-5-opus': defaultModel,
+    'managed:claude-opus-5.5': defaultModel
   };
 
-  // Custom mapping from env var (JSON format, e.g. {"gpt-6-astra": "claude-opus-5.5"})
+  // Custom mapping from env var (JSON format, e.g. {"gpt-6-astra": "managed:claude-opus-5.5"})
   if (process.env.MODEL_MAP) {
     try {
       const custom = JSON.parse(process.env.MODEL_MAP);
@@ -36,3 +37,4 @@ export function resolveUpstreamModel(requestedModel?: string): string {
   const lookupKey = requestedModel.toLowerCase().trim();
   return mappings[lookupKey] || requestedModel;
 }
+

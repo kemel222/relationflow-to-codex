@@ -1,11 +1,35 @@
 import express, { type Request, type Response } from 'express';
 import crypto from 'node:crypto';
-import { TokenManager, type TokenManagerConfig } from './token-manager.ts';
+import fs from 'node:fs';
+import path from 'node:path';
+import { TokenManager, type TokenState } from './token-manager.ts';
 import { resolveUpstreamModel } from './model-resolver.ts';
+
+// Auto-load .env if present
+function loadEnv() {
+  const envPath = path.resolve('.env');
+  if (fs.existsSync(envPath)) {
+    const lines = fs.readFileSync(envPath, 'utf-8').split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx !== -1) {
+        const key = trimmed.slice(0, eqIdx).trim();
+        const val = trimmed.slice(eqIdx + 1).trim();
+        if (!process.env[key]) {
+          process.env[key] = val;
+        }
+      }
+    }
+  }
+}
+loadEnv();
 
 export interface ProxyConfig {
   port?: number;
   relationFlowUrl: string;
+  accountSlug?: string;
   tokenManager: TokenManager;
 }
 
@@ -19,7 +43,20 @@ export interface ChatCompletionRequest {
   messages: ChatMessage[];
   stream?: boolean;
   temperature?: number;
+  threadId?: string;
   [key: string]: any;
+}
+
+function formatMessagesForRelationFlow(messages: ChatMessage[]): string {
+  if (!messages || messages.length === 0) return '';
+  if (messages.length === 1) return messages[0].content;
+
+  return messages.map(m => {
+    const role = (m.role || 'user').toLowerCase();
+    if (role === 'system') return `[System Instructions]:\n${m.content}`;
+    if (role === 'assistant') return `[Assistant]:\n${m.content}`;
+    return `[User]:\n${m.content}`;
+  }).join('\n\n');
 }
 
 export function createProxyApp(config: ProxyConfig) {
@@ -37,6 +74,12 @@ export function createProxyApp(config: ProxyConfig) {
       data: [
         {
           id: defaultModel,
+          object: 'model',
+          created: 1700000000,
+          owned_by: 'relationflow'
+        },
+        {
+          id: 'claude-opus-5.5',
           object: 'model',
           created: 1700000000,
           owned_by: 'relationflow'
@@ -84,35 +127,66 @@ export function createProxyApp(config: ProxyConfig) {
     const isStream = Boolean(body.stream);
     const chatId = `chatcmpl-${crypto.randomUUID()}`;
     const created = Math.floor(Date.now() / 1000);
-    const model = body.model || 'relationflow-chat';
+    const clientModel = body.model || 'managed:claude-opus-5.5';
 
     try {
       // 1. Obtain valid access token (refreshes via Supabase Auth if needed)
-      const tokenState = await config.tokenManager.getValidToken();
+      let tokenState = await config.tokenManager.getValidToken();
 
-      // 2. Prepare headers for RelationFlow
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${tokenState.access_token}`
+      // 2. Prepare request payload for RelationFlow /api/chat
+      const upstreamModel = resolveUpstreamModel(body.model);
+      const accountSlug = config.accountSlug || process.env.ACCOUNT_SLUG || 'mihjrus1xyp7';
+      const messageContent = formatMessagesForRelationFlow(body.messages);
+
+      const upstreamBody: Record<string, any> = {
+        clientTurnId: crypto.randomUUID(),
+        accountSlug,
+        model: upstreamModel,
+        useRag: false,
+        knowledgeEnabled: false,
+        connectorsEnabled: false,
+        message: messageContent,
+        knowledgeMentionFileIds: []
       };
 
-      if (tokenState.session_cookie) {
-        headers['Cookie'] = tokenState.session_cookie;
+      if (body.threadId) {
+        upstreamBody.threadId = body.threadId;
       }
 
-      // 3. Forward request to RelationFlow /api/chat with model mapping
-      const upstreamModel = resolveUpstreamModel(body.model);
-      const upstreamBody = {
-        ...body,
-        model: upstreamModel
+      const buildHeaders = (token: TokenState) => {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Accept': '*/*',
+          'Origin': config.relationFlowUrl,
+          'Referer': `${config.relationFlowUrl}/dashboard/${accountSlug}/chat`,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        };
+        if (token.session_cookie) {
+          headers['Cookie'] = token.session_cookie;
+        }
+        if (token.access_token) {
+          headers['Authorization'] = `Bearer ${token.access_token}`;
+        }
+        return headers;
       };
 
       const upstreamUrl = `${config.relationFlowUrl.replace(/\/+$/, '')}/api/chat`;
-      const upstreamResponse = await fetch(upstreamUrl, {
+      let upstreamResponse = await fetch(upstreamUrl, {
         method: 'POST',
-        headers,
+        headers: buildHeaders(tokenState),
         body: JSON.stringify(upstreamBody)
       });
+
+      // Auto retry once on 401 with force token refresh
+      if (upstreamResponse.status === 401) {
+        console.log('[Proxy] Upstream 401: force refreshing Supabase session token...');
+        tokenState = await config.tokenManager.forceRefresh();
+        upstreamResponse = await fetch(upstreamUrl, {
+          method: 'POST',
+          headers: buildHeaders(tokenState),
+          body: JSON.stringify(upstreamBody)
+        });
+      }
 
       if (!upstreamResponse.ok) {
         const errorText = await upstreamResponse.text();
@@ -156,7 +230,7 @@ export function createProxyApp(config: ProxyConfig) {
               id: chatId,
               object: 'chat.completion.chunk',
               created,
-              model,
+              model: clientModel,
               choices: [
                 {
                   index: 0,
@@ -174,7 +248,7 @@ export function createProxyApp(config: ProxyConfig) {
             id: chatId,
             object: 'chat.completion.chunk',
             created,
-            model,
+            model: clientModel,
             choices: [
               {
                 index: 0,
@@ -201,7 +275,7 @@ export function createProxyApp(config: ProxyConfig) {
           id: chatId,
           object: 'chat.completion',
           created,
-          model,
+          model: clientModel,
           choices: [
             {
               index: 0,
@@ -243,9 +317,10 @@ export function createProxyApp(config: ProxyConfig) {
 // Standalone execution entrypoint
 if (process.argv[1] && process.argv[1].endsWith('proxy.ts')) {
   const port = parseInt(process.env.PORT || '3000', 10);
-  const supabaseUrl = process.env.SUPABASE_URL || 'http://localhost:54321';
-  const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || 'default-anon-key';
-  const relationFlowUrl = process.env.RELATIONFLOW_URL || 'http://localhost:4000';
+  const supabaseUrl = process.env.SUPABASE_URL || 'https://auth.relationflow.io';
+  const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || 'sb_publishable_tHnRZvqCh23wsocWynthJg_5bQVoFsA';
+  const relationFlowUrl = process.env.RELATIONFLOW_URL || 'https://app.relationflow.io';
+  const accountSlug = process.env.ACCOUNT_SLUG || 'mihjrus1xyp7';
 
   const tokenManager = new TokenManager({
     supabaseUrl,
@@ -261,6 +336,7 @@ if (process.argv[1] && process.argv[1].endsWith('proxy.ts')) {
   const app = createProxyApp({
     port,
     relationFlowUrl,
+    accountSlug,
     tokenManager
   });
 
