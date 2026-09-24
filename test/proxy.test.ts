@@ -220,8 +220,8 @@ test('RelationFlow Proxy End-to-End Suite', async (t) => {
     const lastUpstreamCall = upstreams.relationFlowHistory[upstreams.relationFlowHistory.length - 1];
     assert.equal(
       lastUpstreamCall.body.model,
-      'gpt-4o',
-      'Should remap gpt-6-astra to configured DEFAULT_MODEL (gpt-4o)'
+      'claude-opus-5.5',
+      'Should remap gpt-6-astra to configured DEFAULT_MODEL (claude-opus-5.5)'
     );
   });
 });
