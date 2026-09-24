@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { TokenManager, type TokenState } from './token-manager.ts';
 import { resolveUpstreamModel } from './model-resolver.ts';
+import { uploadAttachment } from './attachment-manager.ts';
 
 // Auto-load .env if present
 function loadEnv() {
@@ -26,6 +27,26 @@ function loadEnv() {
 }
 loadEnv();
 
+const THREAD_FILE = path.resolve('thread_state.json');
+
+export function getActiveThreadId(): string {
+  try {
+    if (fs.existsSync(THREAD_FILE)) {
+      const data = JSON.parse(fs.readFileSync(THREAD_FILE, 'utf-8'));
+      if (data.threadId) return data.threadId;
+    }
+  } catch {}
+  return process.env.ACTIVE_THREAD_ID || 'a8d485fd-cd18-4abf-be15-288d6880670e';
+}
+
+export function saveActiveThreadId(threadId: string): void {
+  try {
+    fs.writeFileSync(THREAD_FILE, JSON.stringify({ threadId, updatedAt: new Date().toISOString() }, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('[Proxy] Failed to save thread ID:', e);
+  }
+}
+
 export interface ProxyConfig {
   port?: number;
   relationFlowUrl: string;
@@ -47,10 +68,8 @@ export interface ChatCompletionRequest {
   [key: string]: any;
 }
 
-function formatMessagesForRelationFlow(messages: ChatMessage[]): string {
+export function formatMessagesForRelationFlow(messages: ChatMessage[], maxChars = 9800): string {
   if (!messages || messages.length === 0) return '';
-
-  const MAX_CHARS = 9800; // Leave safety margin below RelationFlow's 10,000 char limit
 
   const formatted = messages.map(m => {
     const role = (m.role || 'user').toLowerCase();
@@ -61,8 +80,8 @@ function formatMessagesForRelationFlow(messages: ChatMessage[]): string {
 
   // Most recent message has top priority
   let lastMsg = formatted[formatted.length - 1];
-  if (lastMsg.length > MAX_CHARS) {
-    return lastMsg.slice(0, MAX_CHARS - 120) + '\n\n[... Truncated to 9800 chars due to RelationFlow message length limit]';
+  if (lastMsg.length > maxChars) {
+    return lastMsg.slice(0, maxChars - 120) + '\n\n[... Truncated to fit RelationFlow message limit]';
   }
 
   // Work backwards from the second to last message to include recent context
@@ -71,7 +90,7 @@ function formatMessagesForRelationFlow(messages: ChatMessage[]): string {
 
   for (let i = formatted.length - 2; i >= 0; i--) {
     const msg = formatted[i];
-    if (currentLen + msg.length + 2 <= MAX_CHARS) {
+    if (currentLen + msg.length + 2 <= maxChars) {
       selected.unshift(msg);
       currentLen += msg.length + 2;
     } else {
@@ -82,13 +101,24 @@ function formatMessagesForRelationFlow(messages: ChatMessage[]): string {
   return selected.join('\n\n');
 }
 
-
 export function createProxyApp(config: ProxyConfig) {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '50mb' }));
 
   app.get('/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({
+      status: 'ok',
+      activeThreadId: getActiveThreadId(),
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  // Endpoint to reset thread / start fresh conversation
+  app.all(['/v1/thread/new', '/v1/thread/reset'], (_req: Request, res: Response) => {
+    const newThreadId = crypto.randomUUID();
+    saveActiveThreadId(newThreadId);
+    console.log(`[Proxy] Active thread reset to new ID: ${newThreadId}`);
+    res.json({ status: 'ok', message: 'Thread reset successfully', threadId: newThreadId });
   });
 
   app.get(['/v1', '/v1/models'], (_req: Request, res: Response) => {
@@ -160,21 +190,55 @@ export function createProxyApp(config: ProxyConfig) {
       // 2. Prepare request payload for RelationFlow /api/chat
       const upstreamModel = resolveUpstreamModel(body.model);
       const accountSlug = config.accountSlug || process.env.ACCOUNT_SLUG || 'mihjrus1xyp7';
-      const messageContent = formatMessagesForRelationFlow(body.messages);
+      const activeThreadId = body.threadId || getActiveThreadId();
+
+      // Join full content to check size
+      const rawFullMessage = body.messages.map(m => m.content).join('\n\n');
+      let attachments: any[] = [];
+      let finalMessage = '';
+
+      // If prompt/files exceed 7500 chars, auto-upload full context as encrypted attachment
+      // so Claude receives up to 100k+ tokens without hitting 10,000 char message limit!
+      if (rawFullMessage.length > 7500) {
+        console.log(`[Proxy] Large prompt detected (${rawFullMessage.length} chars). Uploading as encrypted attachment...`);
+        try {
+          attachments = await uploadAttachment({
+            content: rawFullMessage,
+            fileName: 'context.txt',
+            mimeType: 'text/plain',
+            threadId: activeThreadId,
+            accountSlug,
+            relationFlowUrl: config.relationFlowUrl,
+            tokenManager: config.tokenManager
+          });
+          console.log(`[Proxy] Attachment uploaded successfully. Attachment IDs:`, attachments.map(a => a.id));
+
+          // Get last user prompt as the message text
+          const lastUserMsg = body.messages.filter(m => m.role === 'user').pop();
+          const instruction = lastUserMsg ? lastUserMsg.content.slice(0, 2000) : 'Обработай прикрепленный файл и контекст.';
+          finalMessage = `[Полный контекст диалога и прикрепленные файлы загружены во вложение]\n\nЗапрос пользователя:\n${instruction}`;
+        } catch (attErr) {
+          console.warn('[Proxy] Auto-attachment upload failed, falling back to message budgeting:', attErr);
+          finalMessage = formatMessagesForRelationFlow(body.messages, 9800);
+        }
+      } else {
+        finalMessage = formatMessagesForRelationFlow(body.messages, 9800);
+      }
 
       const upstreamBody: Record<string, any> = {
+        threadId: activeThreadId,
         clientTurnId: crypto.randomUUID(),
         accountSlug,
         model: upstreamModel,
         useRag: false,
         knowledgeEnabled: false,
         connectorsEnabled: false,
-        message: messageContent,
+        message: finalMessage,
         knowledgeMentionFileIds: []
       };
 
-      if (body.threadId) {
-        upstreamBody.threadId = body.threadId;
+      if (attachments && attachments.length > 0) {
+        upstreamBody.attachments = attachments;
       }
 
       const buildHeaders = (token: TokenState) => {
@@ -182,7 +246,7 @@ export function createProxyApp(config: ProxyConfig) {
           'Content-Type': 'application/json',
           'Accept': '*/*',
           'Origin': config.relationFlowUrl,
-          'Referer': `${config.relationFlowUrl}/dashboard/${accountSlug}/chat`,
+          'Referer': `${config.relationFlowUrl}/dashboard/${accountSlug}/chat?thread=${activeThreadId}`,
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         };
         if (token.session_cookie) {
@@ -210,6 +274,25 @@ export function createProxyApp(config: ProxyConfig) {
           headers: buildHeaders(tokenState),
           body: JSON.stringify(upstreamBody)
         });
+      }
+
+      // If thread not found (404), reset thread and retry once
+      if (upstreamResponse.status === 404) {
+        console.log('[Proxy] Upstream 404: thread not found, creating new thread...');
+        const newThreadId = crypto.randomUUID();
+        saveActiveThreadId(newThreadId);
+        upstreamBody.threadId = newThreadId;
+        upstreamResponse = await fetch(upstreamUrl, {
+          method: 'POST',
+          headers: buildHeaders(tokenState),
+          body: JSON.stringify(upstreamBody)
+        });
+      }
+
+      // Persist thread ID returned in headers
+      const respThreadId = upstreamResponse.headers.get('x-thread-id');
+      if (respThreadId && respThreadId !== activeThreadId) {
+        saveActiveThreadId(respThreadId);
       }
 
       if (!upstreamResponse.ok) {
@@ -366,6 +449,7 @@ if (process.argv[1] && process.argv[1].endsWith('proxy.ts')) {
 
   app.listen(port, () => {
     console.log(`[RelationFlow Proxy] Listening on http://localhost:${port}`);
+    console.log(`Active thread ID: ${getActiveThreadId()}`);
     console.log(`OpenAI API compatible endpoint: http://localhost:${port}/v1/chat/completions`);
   });
 }
